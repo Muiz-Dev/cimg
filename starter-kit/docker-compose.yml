@@ -42,9 +42,11 @@ services:
     build: ./service
     ports:
       - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      DATABASE_URL: postgresql://vend:vend@postgres:5432/vend
-      OPERATOR_URL: http://operator:9000
+      DATABASE_URL: postgresql://vend:vend@${DATABASE_HOST:-postgres}:5432/vend
+      OPERATOR_URL: http://${OPERATOR_HOST:-operator}:9000
       OPERATOR_API_KEY: sk_test_operator_7f3a9c1e
     depends_on:
       operator:
