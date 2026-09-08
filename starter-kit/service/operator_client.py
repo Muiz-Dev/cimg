@@ -70,6 +70,12 @@ class OperatorClient:
                         data = res.json()
                     except Exception:
                         data = {}
+                    if res.status_code == 429:
+                        return {
+                            "status": "RETRYABLE",
+                            "operator_ref": None,
+                            "reason_code": data.get("reason_code", "RATE_LIMITED"),
+                        }
                     return {
                         "status": "REJECTED",
                         "operator_ref": None,
@@ -115,22 +121,35 @@ class OperatorClient:
                     status_data = status_response.json()
                     if status_data.get("status") == "SUCCESSFUL":
                         match = next(iter(status_data.get("matches", [])), {})
-                        return {"status": "SUCCESSFUL", "operator_ref": match.get("operator_ref")}
-                    if status_data.get("status") == "NOT_FOUND":
-                        return {"status": "PENDING", "operator_ref": None}
+                        settlement = await self._settlement_result(client, client_ref, amount_minor)
+                        if settlement["status"] != "PENDING":
+                            return settlement
+                        return {"status": "PENDING", "operator_ref": match.get("operator_ref")}
 
-                today = datetime.now(timezone.utc).date().isoformat()
-                settlement_response = await client.get(
-                    f"{self.base_url}/v1/settlement/{today}",
-                    headers=headers,
-                )
-                if settlement_response.status_code == 200:
-                    rows = csv.DictReader(StringIO(settlement_response.text))
-                    for row in rows:
-                        if (row.get("client_ref") == client_ref and
-                                int(row.get("amount_minor", 0)) == amount_minor and
-                                row.get("status") == "SUCCESSFUL"):
-                            return {"status": "SUCCESSFUL", "operator_ref": row.get("operator_ref")}
+                return await self._settlement_result(client, client_ref, amount_minor)
         except (httpx.HTTPError, ValueError, TypeError) as exc:
             logger.warning("Could not reconcile client_ref %s: %s", client_ref, exc)
         return {"status": "PENDING", "operator_ref": None}
+
+    async def _settlement_result(self, client, client_ref: str, amount_minor: int) -> dict:
+        today = datetime.now(timezone.utc).date().isoformat()
+        response = await client.get(
+            f"{self.base_url}/v1/settlement/{today}",
+            headers={"X-Api-Key": self.api_key},
+        )
+        if response.status_code != 200:
+            return {"status": "PENDING", "operator_ref": None}
+
+        matches = [
+            row for row in csv.DictReader(StringIO(response.text))
+            if row.get("client_ref") == client_ref
+        ]
+        if not matches:
+            return {"status": "PENDING", "operator_ref": None}
+        if len(matches) != 1:
+            return {"status": "MISMATCH", "operator_ref": None}
+        match = matches[0]
+        if (match.get("status") != "SUCCESSFUL" or
+                int(match.get("amount_minor", 0)) != amount_minor):
+            return {"status": "MISMATCH", "operator_ref": None}
+        return {"status": "SUCCESSFUL", "operator_ref": match.get("operator_ref")}

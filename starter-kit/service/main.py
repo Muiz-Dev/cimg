@@ -31,6 +31,8 @@ async def ussd_handler(
     text: str = Form(""),
     db: Session = Depends(get_db)
 ):
+    if serviceCode != "*384*7000#":
+        return Response(content="END Invalid service code.", media_type="text/plain")
     expire_abandoned_sessions(db)
     text_clean = text.strip()
     parts = [p for p in text_clean.split("*") if p] if text_clean else []
@@ -46,6 +48,8 @@ async def ussd_handler(
             sess = db.query(USSDSession).filter(USSDSession.session_id == sessionId).first()
         else:
             db.refresh(sess)
+    elif sess.msisdn != phoneNumber:
+        return Response(content="END Invalid session.", media_type="text/plain")
 
     if len(parts) == 3:
         sess = db.query(USSDSession).filter(
@@ -104,6 +108,19 @@ async def ussd_handler(
 
         existing_vend = db.query(VendLedger).filter(VendLedger.session_id == sessionId).first()
         if existing_vend:
+            if existing_vend.amount_minor != amount_ngn * 100:
+                return Response(content="END Transaction details do not match the original request.", media_type="text/plain")
+            if existing_vend.status == "RETRYABLE":
+                retry_result = await operator_client.vend(
+                    client_ref=existing_vend.client_ref,
+                    msisdn=existing_vend.msisdn,
+                    network=existing_vend.network,
+                    amount_minor=existing_vend.amount_minor,
+                )
+                existing_vend.status = retry_result.get("status", "UNKNOWN")
+                existing_vend.operator_ref = retry_result.get("operator_ref")
+                existing_vend.reason_code = retry_result.get("reason_code")
+                db.commit()
             if existing_vend.status == "UNKNOWN":
                 reconciliation = await operator_client.reconcile(
                     existing_vend.client_ref, existing_vend.amount_minor
@@ -116,6 +133,8 @@ async def ussd_handler(
                 return Response(content=f"END Airtime purchase of {amount_ngn} NGN successful.", media_type="text/plain")
             if existing_vend.status == "FAILED":
                 return Response(content=f"END Airtime purchase failed: {existing_vend.reason_code or 'Failed'}.", media_type="text/plain")
+            if existing_vend.status == "REJECTED":
+                return Response(content=f"END Airtime purchase rejected: {existing_vend.reason_code or 'Rejected'}.", media_type="text/plain")
             return Response(content="END Airtime purchase is being processed. Please try again later.", media_type="text/plain")
 
         expected_prev_text = f"1*{amount_str}"
@@ -154,6 +173,17 @@ async def ussd_handler(
             amount_minor=amount_minor
         )
 
+        if res.get("status") == "SUCCESSFUL":
+            settlement = await operator_client.reconcile(client_ref, amount_minor)
+            if settlement["status"] != "SUCCESSFUL":
+                res = {
+                    "status": "UNKNOWN",
+                    "operator_ref": res.get("operator_ref"),
+                    "reason_code": "SETTLEMENT_" + settlement["status"],
+                }
+            else:
+                res["operator_ref"] = settlement.get("operator_ref")
+
         vend_entry.status = res.get("status", "UNKNOWN")
         vend_entry.operator_ref = res.get("operator_ref")
         vend_entry.reason_code = res.get("reason_code")
@@ -163,6 +193,10 @@ async def ussd_handler(
             return Response(content=f"END Airtime purchase of {amount_ngn} NGN successful.", media_type="text/plain")
         elif vend_entry.status == "FAILED":
             return Response(content=f"END Airtime purchase failed: {vend_entry.reason_code or 'Failed'}.", media_type="text/plain")
+        elif vend_entry.status == "REJECTED":
+            return Response(content=f"END Airtime purchase rejected: {vend_entry.reason_code or 'Rejected'}.", media_type="text/plain")
+        elif vend_entry.status == "RETRYABLE":
+            return Response(content="END Operator is temporarily unavailable. Please try again.", media_type="text/plain")
         else:
             return Response(content="END Airtime purchase is being processed. Please try again later.", media_type="text/plain")
 
