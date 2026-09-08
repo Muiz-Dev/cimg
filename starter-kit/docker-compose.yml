@@ -1,0 +1,57 @@
+# Cloud Interactive Media Group - Stage 2 exercise scaffold
+#
+# Two services are provided for you:
+#   operator  - the mock telecom partner you must integrate with (do not modify)
+#   postgres  - an empty database for your service to use
+#
+# Add your own service to this file. It must come up with `docker compose up`.
+
+services:
+  operator:
+    build: ./mock-operator
+    ports:
+      - "9000:9000"
+    environment:
+      OPERATOR_API_KEY: sk_test_operator_7f3a9c1e
+      OPERATOR_TIMEOUT_DELAY: "8"
+    volumes:
+      - operator-data:/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://localhost:9000/health')"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: vend
+      POSTGRES_PASSWORD: vend
+      POSTGRES_DB: vend
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vend"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  service:
+    build: ./service
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://vend:vend@postgres:5432/vend
+      OPERATOR_URL: http://operator:9000
+      OPERATOR_API_KEY: sk_test_operator_7f3a9c1e
+    depends_on:
+      operator:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+volumes:
+  operator-data:
+  pg-data:
