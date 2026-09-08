@@ -1,4 +1,7 @@
 import os
+import csv
+from datetime import datetime, timezone
+from io import StringIO
 import httpx
 import logging
 
@@ -98,3 +101,36 @@ class OperatorClient:
                 "operator_ref": None,
                 "reason_code": str(e),
             }
+
+    async def reconcile(self, client_ref: str, amount_minor: int) -> dict:
+        headers = {"X-Api-Key": self.api_key}
+        try:
+            async with httpx.AsyncClient(timeout=1.5) as client:
+                status_response = await client.get(
+                    f"{self.base_url}/v1/status",
+                    params={"client_ref": client_ref},
+                    headers=headers,
+                )
+                if status_response.status_code == 200:
+                    status_data = status_response.json()
+                    if status_data.get("status") == "SUCCESSFUL":
+                        match = next(iter(status_data.get("matches", [])), {})
+                        return {"status": "SUCCESSFUL", "operator_ref": match.get("operator_ref")}
+                    if status_data.get("status") == "NOT_FOUND":
+                        return {"status": "PENDING", "operator_ref": None}
+
+                today = datetime.now(timezone.utc).date().isoformat()
+                settlement_response = await client.get(
+                    f"{self.base_url}/v1/settlement/{today}",
+                    headers=headers,
+                )
+                if settlement_response.status_code == 200:
+                    rows = csv.DictReader(StringIO(settlement_response.text))
+                    for row in rows:
+                        if (row.get("client_ref") == client_ref and
+                                int(row.get("amount_minor", 0)) == amount_minor and
+                                row.get("status") == "SUCCESSFUL"):
+                            return {"status": "SUCCESSFUL", "operator_ref": row.get("operator_ref")}
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            logger.warning("Could not reconcile client_ref %s: %s", client_ref, exc)
+        return {"status": "PENDING", "operator_ref": None}

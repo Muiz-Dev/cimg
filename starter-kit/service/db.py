@@ -44,6 +44,19 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
 
+def expire_abandoned_sessions(db, max_age_minutes=30):
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None).timestamp() - (max_age_minutes * 60)
+    stale = []
+    for session in db.query(USSDSession).all():
+        updated = session.updated_at
+        if updated is not None and updated.replace(tzinfo=None).timestamp() < cutoff:
+            stale.append(session)
+    for session in stale:
+        db.delete(session)
+    if stale:
+        db.commit()
+
+
 def get_db():
     db = SessionLocal()
     try:

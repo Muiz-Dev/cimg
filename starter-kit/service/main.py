@@ -5,7 +5,7 @@ from fastapi import FastAPI, Form, Depends, Response
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
-from db import init_db, get_db, USSDSession, VendLedger
+from db import init_db, get_db, USSDSession, VendLedger, expire_abandoned_sessions
 from operator_client import OperatorClient, detect_network
 
 logging.basicConfig(level=logging.INFO)
@@ -31,19 +31,26 @@ async def ussd_handler(
     text: str = Form(""),
     db: Session = Depends(get_db)
 ):
+    expire_abandoned_sessions(db)
     text_clean = text.strip()
     parts = [p for p in text_clean.split("*") if p] if text_clean else []
 
-    # Get or create session
-    is_new_session = False
     sess = db.query(USSDSession).filter(USSDSession.session_id == sessionId).first()
     if not sess:
-        is_new_session = True
         sess = USSDSession(session_id=sessionId, msisdn=phoneNumber, last_text=text_clean if text_clean else "__INITIAL__")
         db.add(sess)
-        db.commit()
-        db.refresh(sess)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            sess = db.query(USSDSession).filter(USSDSession.session_id == sessionId).first()
+        else:
+            db.refresh(sess)
 
+    if len(parts) == 3:
+        sess = db.query(USSDSession).filter(
+            USSDSession.session_id == sessionId
+        ).with_for_update().first()
     previous_text = sess.last_text
 
     # Menu Routing Logic based on text inputs
@@ -95,14 +102,24 @@ async def ussd_handler(
         if confirm_opt != "1":
             return Response(content="END Transaction cancelled.", media_type="text/plain")
 
-        # Check for existing vend (gateway-retry or double-tap)
         existing_vend = db.query(VendLedger).filter(VendLedger.session_id == sessionId).first()
         if existing_vend:
-            return Response(content=f"END Airtime purchase of {amount_ngn} NGN already processed.", media_type="text/plain")
+            if existing_vend.status == "UNKNOWN":
+                reconciliation = await operator_client.reconcile(
+                    existing_vend.client_ref, existing_vend.amount_minor
+                )
+                if reconciliation["status"] == "SUCCESSFUL":
+                    existing_vend.status = "SUCCESSFUL"
+                    existing_vend.operator_ref = reconciliation.get("operator_ref")
+                    db.commit()
+            if existing_vend.status == "SUCCESSFUL":
+                return Response(content=f"END Airtime purchase of {amount_ngn} NGN successful.", media_type="text/plain")
+            if existing_vend.status == "FAILED":
+                return Response(content=f"END Airtime purchase failed: {existing_vend.reason_code or 'Failed'}.", media_type="text/plain")
+            return Response(content="END Airtime purchase is being processed. Please try again later.", media_type="text/plain")
 
-        # Check for out-of-order execution (session received main menu previously but never selected amount)
         expected_prev_text = f"1*{amount_str}"
-        if not is_new_session and previous_text != expected_prev_text and previous_text != text_clean:
+        if previous_text != expected_prev_text:
             return Response(content="CON Out of order action. Welcome to Airtime Vend\n1. Buy Airtime", media_type="text/plain")
 
         sess.last_text = text_clean
@@ -130,7 +147,6 @@ async def ussd_handler(
             db.rollback()
             return Response(content=f"END Airtime purchase of {amount_ngn} NGN already processed.", media_type="text/plain")
 
-        # Call operator API
         res = await operator_client.vend(
             client_ref=client_ref,
             msisdn=phoneNumber,
@@ -148,7 +164,7 @@ async def ussd_handler(
         elif vend_entry.status == "FAILED":
             return Response(content=f"END Airtime purchase failed: {vend_entry.reason_code or 'Failed'}.", media_type="text/plain")
         else:
-            return Response(content=f"END Airtime purchase submitted with status {vend_entry.status}.", media_type="text/plain")
+            return Response(content="END Airtime purchase is being processed. Please try again later.", media_type="text/plain")
 
     else:
         return Response(content="END Invalid input sequence.", media_type="text/plain")
