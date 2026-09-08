@@ -1,6 +1,8 @@
 import os
+import time
 from datetime import datetime, timezone
 from sqlalchemy import create_engine, Column, String, Integer, DateTime
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://vend:vend@postgres:5432/vend")
@@ -40,8 +42,15 @@ class VendLedger(Base):
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
 
-def init_db():
-    Base.metadata.create_all(bind=engine)
+def init_db(retries=30, delay_seconds=2):
+    for attempt in range(retries):
+        try:
+            Base.metadata.create_all(bind=engine)
+            return
+        except OperationalError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay_seconds)
 
 
 def expire_abandoned_sessions(db, max_age_minutes=30):
